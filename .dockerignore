@@ -1,0 +1,5 @@
+*
+!entrypoint.mjs
+!upstream/puppet/ha-puppet/
+upstream/puppet/ha-puppet/node_modules
+upstream/puppet/ha-puppet/options-dev.json

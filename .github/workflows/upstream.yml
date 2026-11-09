@@ -1,0 +1,96 @@
+name: Upstream
+
+on:
+  schedule:
+    - cron: "23 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: upstream
+  cancel-in-progress: false
+
+jobs:
+  check:
+    name: Check upstream Puppet
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.check.outputs.changed }}
+      current: ${{ steps.check.outputs.current }}
+      latest: ${{ steps.check.outputs.latest }}
+      current_version: ${{ steps.check.outputs.current_version }}
+      latest_version: ${{ steps.check.outputs.latest_version }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Compare pinned revision with upstream
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          repo=balloob/home-assistant-addons
+          current="$(tr -d '[:space:]' < UPSTREAM)"
+          latest="$(gh api "repos/${repo}/commits?path=puppet&per_page=1" --jq '.[0].sha')"
+          echo "$latest" | grep -Eqx '[0-9a-f]{40}'
+          version_at() {
+            gh api "repos/${repo}/contents/puppet/config.yaml?ref=$1" --jq '.content' | base64 -d | yq -r '.version'
+          }
+          current_version="$(version_at "$current")"
+          latest_version="$(version_at "$latest")"
+          changed=false
+          [ "$current" != "$latest" ] && changed=true
+          {
+            echo "changed=$changed"
+            echo "current=$current"
+            echo "latest=$latest"
+            echo "current_version=$current_version"
+            echo "latest_version=$latest_version"
+          } >> "$GITHUB_OUTPUT"
+          echo "Pinned ${current:0:7} (${current_version}), upstream ${latest:0:7} (${latest_version}), changed=${changed}" >> "$GITHUB_STEP_SUMMARY"
+
+  build:
+    name: Test build
+    needs: check
+    if: needs.check.outputs.changed == 'true'
+    uses: ./.github/workflows/ci.yml
+    with:
+      upstream_ref: ${{ needs.check.outputs.latest }}
+
+  pull-request:
+    name: Open pull request
+    needs: [check, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Update pin
+        env:
+          LATEST: ${{ needs.check.outputs.latest }}
+        run: echo "$LATEST" > UPSTREAM
+
+      - uses: peter-evans/create-pull-request@v8
+        with:
+          branch: chore/upstream-puppet
+          delete-branch: true
+          sign-commits: true
+          commit-message: "chore(upstream): bump Puppet to ${{ needs.check.outputs.latest_version }} (${{ needs.check.outputs.latest }})"
+          title: "chore(upstream): bump Puppet to ${{ needs.check.outputs.latest_version }}"
+          body: |
+            Upstream `puppet/` changed in balloob/home-assistant-addons.
+
+            | | Revision | Version |
+            |---|---|---|
+            | Pinned | `${{ needs.check.outputs.current }}` | ${{ needs.check.outputs.current_version }} |
+            | Upstream | `${{ needs.check.outputs.latest }}` | ${{ needs.check.outputs.latest_version }} |
+
+            Diff: https://github.com/balloob/home-assistant-addons/compare/${{ needs.check.outputs.current }}...${{ needs.check.outputs.latest }}
+
+            The image built and passed the smoke test at the new revision (amd64 and arm64) before this PR was opened.
+          labels: upstream

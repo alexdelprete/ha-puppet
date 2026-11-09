@@ -1,0 +1,102 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      upstream_ref:
+        description: Upstream commit to build instead of the one pinned in UPSTREAM
+        type: string
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}-${{ inputs.upstream_ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build and smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Resolve upstream revision
+        id: pin
+        env:
+          OVERRIDE: ${{ inputs.upstream_ref }}
+        run: |
+          sha="${OVERRIDE:-$(tr -d '[:space:]' < UPSTREAM)}"
+          echo "$sha" | grep -Eqx '[0-9a-f]{40}'
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v7
+        with:
+          repository: balloob/home-assistant-addons
+          ref: ${{ steps.pin.outputs.sha }}
+          path: upstream
+          persist-credentials: false
+
+      - name: Read upstream version
+        id: up
+        run: |
+          version="$(yq -r '.version' upstream/puppet/config.yaml)"
+          test -n "$version" && test "$version" != null
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Upstream Puppet $version at ${{ steps.pin.outputs.sha }}" >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: docker/setup-qemu-action@v4
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Build amd64
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          tags: ha-puppet:ci
+          build-args: |
+            UPSTREAM_REVISION=${{ steps.pin.outputs.sha }}
+            UPSTREAM_VERSION=${{ steps.up.outputs.version }}
+          cache-from: type=gha,scope=amd64
+          cache-to: type=gha,scope=amd64,mode=max
+
+      - name: Smoke test
+        run: |
+          docker run -d --name puppet -e HA_URL=http://127.0.0.1:8123 ha-puppet:ci
+          status=starting
+          for _ in $(seq 1 45); do
+            status="$(docker inspect -f '{{.State.Health.Status}}' puppet)"
+            [ "$status" = healthy ] && break
+            sleep 2
+          done
+          docker logs puppet
+          echo "health: $status"
+          test "$status" = healthy
+          test "$(docker exec puppet id -u)" = 1000
+          docker exec puppet sh -c 'test "$(stat -c %a /data/options.json)" = 600'
+          docker exec puppet test ! -e /app/options-dev.json
+          docker exec puppet /usr/bin/chromium --version
+          docker inspect -f '{{index .Config.Labels "io.github.alexdelprete.ha-puppet.upstream.version"}}' ha-puppet:ci \
+            | grep -qx '${{ steps.up.outputs.version }}'
+          docker rm -f puppet
+
+      - name: Build arm64
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/arm64
+          push: false
+          build-args: |
+            UPSTREAM_REVISION=${{ steps.pin.outputs.sha }}
+            UPSTREAM_VERSION=${{ steps.up.outputs.version }}
+          cache-from: type=gha,scope=arm64
+          cache-to: type=gha,scope=arm64,mode=max
