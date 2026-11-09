@@ -92,5 +92,5 @@ jobs:
 
             Diff: https://github.com/balloob/home-assistant-addons/compare/${{ needs.check.outputs.current }}...${{ needs.check.outputs.latest }}
 
-            The image built and passed the smoke test at the new revision (amd64 and arm64) before this PR was opened.
+            The image built and passed the smoke test at the new revision (amd64 and arm64) before this PR was opened. Merging publishes it as the next build (`<Puppet version>-<packaging>.<build>`).
           labels: upstream

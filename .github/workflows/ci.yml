@@ -1,8 +1,6 @@
 name: CI
 
 on:
-  push:
-    branches: [main]
   pull_request:
   workflow_dispatch:
   workflow_call:
@@ -85,6 +83,7 @@ jobs:
           docker exec puppet sh -c 'test "$(stat -c %a /data/options.json)" = 600'
           docker exec puppet test ! -e /app/options-dev.json
           docker exec puppet /usr/bin/chromium --version
+          docker logs puppet 2>&1 | grep -qF "ha-puppet dev, Puppet ${{ steps.up.outputs.version }}"
           docker inspect -f '{{index .Config.Labels "io.github.alexdelprete.ha-puppet.upstream.version"}}' ha-puppet:ci \
             | grep -qx '${{ steps.up.outputs.version }}'
           docker rm -f puppet

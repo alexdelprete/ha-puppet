@@ -16,20 +16,20 @@ The Puppet source is not vendored or modified. Every build checks out the upstre
 ## What this image adds
 
 - **Pinned upstream**: the exact upstream commit and Puppet version are recorded in the image labels and in every release note.
-- **Semver releases**: immutable `X.Y.Z` tags, plus moving `X.Y`, `X` and `latest`.
+- **Versioned builds**: every published image has an immutable tag naming the upstream Puppet version and the build, and is only published when something inside it changed (see [Tags](#tags)).
 - **amd64 and arm64**.
 - **Non-root**: runs as `node` (uid 1000). Upstream launches Chromium with `--no-sandbox`, so not running as root matters.
 - **Configuration from environment**: no options file to hand-craft; Docker secrets supported.
 - **Healthcheck** and **tini** as init (reaps Chromium child processes).
 - **Supply chain**: SBOM and provenance attestations, GitHub artifact attestation, keyless cosign signature.
-- **Upstream tracking**: a daily workflow test-builds new upstream revisions and opens a pull request.
+- **Upstream tracking**: a daily workflow test-builds new upstream revisions and opens a pull request; a daily rebuild publishes Debian (Chromium) security updates.
 
 ## Usage
 
 ```yaml
 services:
   ha-puppet:
-    image: ghcr.io/alexdelprete/ha-puppet:1
+    image: ghcr.io/alexdelprete/ha-puppet:latest
     container_name: ha-puppet
     restart: unless-stopped
     environment:
@@ -68,21 +68,50 @@ At start the entrypoint writes `/data/options.json`, the file upstream reads in 
 
 Puppet's HTTP listener on port 10000 has **no authentication**, and anyone who can reach it can screenshot any Home Assistant page the token can see. Publish it on `127.0.0.1` or keep it on an internal container network; never expose it to the internet.
 
-## Versions
+## Tags
 
-Image versions follow [Semantic Versioning](https://semver.org) and are independent of the upstream Puppet version, which every release note states.
+Every published build gets one immutable tag and moves two others.
 
-- **Major**: breaking changes to how the container is run (variables, paths, user, port).
-- **Minor**: a new upstream Puppet release, or new image features.
-- **Patch**: base image, dependency or upstream fix updates.
+```
+2.6.1-1.3     immutable   this exact build
+2.6.1-1       moving      the newest build of Puppet 2.6.1, packaging revision 1
+latest        moving      the newest build of anything
+```
 
-Pin `X.Y.Z` or a digest for reproducible deployments; `X` follows non-breaking updates.
+The immutable tag is read as `<Puppet version>-<packaging revision>.<build>`:
+
+- `2.6.1` is the upstream Puppet version, from `puppet/config.yaml` in [balloob/home-assistant-addons](https://github.com/balloob/home-assistant-addons) at the revision pinned in [`UPSTREAM`](UPSTREAM).
+- `-1` is this repository's packaging revision, kept in [`PACKAGING`](PACKAGING). It changes only for breaking changes to how the container is run (environment variables, paths, user, port), the role Debian's packaging revision plays for a distribution package.
+- `.3` is the build number: the third published image of that Puppet version and packaging revision. It increments when anything else inside the image changes: Debian packages (Chromium security updates are the usual reason), the Node base image, npm dependencies, a new upstream commit without a version bump, or this repository's build inputs. It resets to `.1` when the Puppet version or the packaging revision changes.
+
+A build is published only when its manifest differs from the previous release's. The daily build compares the installed Debian and npm package versions, Node, the upstream revision and a hash of the build inputs, and publishes nothing when they are identical. Each release lists what changed and attaches the full `manifest.txt`.
+
+Pin the immutable tag for reproducibility, the moving `2.6.1-1` tag to receive security rebuilds without editing your compose file, or `latest` to receive everything.
+
+The version is stamped into the image, so a running container can say what it is regardless of the tag it was started from:
+
+```
+docker inspect ha-puppet --format '{{index .Config.Labels "org.opencontainers.image.version"}}'
+docker logs ha-puppet 2>&1 | grep 'ha-puppet '
+```
+
+The first returns the immutable tag, the second the boot line `[ha-puppet] ha-puppet 2.6.1-1.3, Puppet 2.6.1`. `org.opencontainers.image.revision` holds the commit of this repository it was built from.
+
+### SemVer
+
+The tags are valid Semantic Versioning 2.0.0: the Puppet version is major.minor.patch, and `<packaging>.<build>` is the prerelease field, compared as dot-separated numeric identifiers:
+
+```
+2.6.1-1  <  2.6.1-1.1  <  2.6.1-1.2  <  2.6.1-1.10  <  2.6.1-2.1  <  2.6.2-1.1
+```
+
+The moving `2.6.1-1` tag sorts below every build it points to, so an update checker watching an immutable tag never offers it as an update. This was checked against the tag comparison code of What's Up Docker (`isGreater` in getwud/wud, November 2026). A bare moving `2.6.1` tag would not have that property: WUD ranks a bare tag above any suffixed tag with the same version.
 
 ### Verify an image
 
 ```
-gh attestation verify oci://ghcr.io/alexdelprete/ha-puppet:1.0.0 --owner alexdelprete
-cosign verify ghcr.io/alexdelprete/ha-puppet:1.0.0 \
+gh attestation verify oci://ghcr.io/alexdelprete/ha-puppet:2.6.1-1.1 --owner alexdelprete
+cosign verify ghcr.io/alexdelprete/ha-puppet:2.6.1-1.1 \
   --certificate-identity-regexp '^https://github.com/alexdelprete/ha-puppet/' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 ```

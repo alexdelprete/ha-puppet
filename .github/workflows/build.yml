@@ -1,0 +1,349 @@
+name: Build and publish
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "0 12 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/ha-puppet
+
+jobs:
+  test:
+    name: Test
+    if: github.event_name != 'schedule'
+    uses: ./.github/workflows/ci.yml
+
+  publish:
+    name: Build, compare, publish
+    needs: test
+    if: ${{ !cancelled() && (needs.test.result == 'success' || needs.test.result == 'skipped') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+      id-token: write
+      attestations: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Resolve upstream and packaging
+        id: pin
+        run: |
+          sha="$(tr -d '[:space:]' < UPSTREAM)"
+          echo "$sha" | grep -Eqx '[0-9a-f]{40}'
+          packaging="$(tr -d '[:space:]' < PACKAGING)"
+          echo "$packaging" | grep -Eqx '[1-9][0-9]*'
+          {
+            echo "sha=$sha"
+            echo "packaging=$packaging"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v7
+        with:
+          repository: balloob/home-assistant-addons
+          ref: ${{ steps.pin.outputs.sha }}
+          path: upstream
+          persist-credentials: false
+
+      - name: Read upstream version
+        id: up
+        run: |
+          version="$(yq -r '.version' upstream/puppet/config.yaml)"
+          echo "$version" | grep -Eqx '[0-9]+\.[0-9]+\.[0-9]+'
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-qemu-action@v4
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build amd64 from scratch
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          no-cache: true
+          tags: ${{ env.IMAGE }}:build
+          build-args: |
+            UPSTREAM_REVISION=${{ steps.pin.outputs.sha }}
+            UPSTREAM_VERSION=${{ steps.up.outputs.version }}
+          cache-to: type=gha,scope=publish-amd64,mode=max
+
+      - name: Extract manifest
+        env:
+          UPSTREAM_SHA: ${{ steps.pin.outputs.sha }}
+          UPSTREAM_VERSION: ${{ steps.up.outputs.version }}
+          PACKAGING: ${{ steps.pin.outputs.packaging }}
+        run: |
+          img="${IMAGE}:build"
+          {
+            docker run --rm --entrypoint dpkg-query "$img" -f='${Package} ${Version}\n' -W
+            docker run --rm --entrypoint node "$img" -e '
+              const lock = require("/app/package-lock.json");
+              for (const [path, pkg] of Object.entries(lock.packages || {})) {
+                if (!path.startsWith("node_modules/") || pkg.dev) continue;
+                console.log(`npm:${path.split("node_modules/").pop()} ${pkg.version}`);
+              }'
+          } | sort -u > manifest.txt
+          {
+            echo "_node $(docker run --rm --entrypoint node "$img" --version)"
+            echo "_upstream-revision ${UPSTREAM_SHA}"
+            echo "_upstream-version ${UPSTREAM_VERSION}"
+            echo "_packaging ${PACKAGING}"
+            echo "_build-inputs $(git ls-files -s Dockerfile entrypoint.mjs .dockerignore PACKAGING | sha256sum | cut -c1-12)"
+          } >> manifest.txt
+          grep -q '^chromium ' manifest.txt
+          grep -q '^npm:puppeteer ' manifest.txt
+          echo "$(grep -vc '^_' manifest.txt) packages, $(grep -c '^npm:' manifest.txt) of them npm"
+
+      - name: Compare with previous release
+        id: compare
+        run: |
+          prev_tag="$(gh release list --repo "$GITHUB_REPOSITORY" --exclude-drafts --exclude-pre-releases \
+            --limit 1 --json tagName --jq '.[0].tagName // empty')"
+          echo "prev_tag=${prev_tag}" >> "$GITHUB_OUTPUT"
+          if [ -z "$prev_tag" ]; then
+            echo "no previous release, publishing"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          gh release download "$prev_tag" --repo "$GITHUB_REPOSITORY" --pattern manifest.txt --output prev-manifest.txt
+          if cmp -s manifest.txt prev-manifest.txt; then
+            echo "manifest identical to ${prev_tag}, nothing to publish"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "manifest differs from ${prev_tag}, publishing"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Determine version
+        id: ver
+        if: steps.compare.outputs.changed == 'true'
+        env:
+          PREFIX: ${{ steps.up.outputs.version }}-${{ steps.pin.outputs.packaging }}
+        run: |
+          pattern="^$(printf '%s' "$PREFIX" | sed 's/\./\\./g')\.[0-9]+$"
+          last="$(gh api "repos/${GITHUB_REPOSITORY}/releases" --paginate --jq '.[].tag_name' \
+            | grep -E "$pattern" | sed 's/.*\.//' | sort -n | tail -1 || true)"
+          n=$(( ${last:-0} + 1 ))
+          {
+            echo "prefix=${PREFIX}"
+            echo "n=${n}"
+            echo "tag=${PREFIX}.${n}"
+          } >> "$GITHUB_OUTPUT"
+          echo "version ${PREFIX}.${n}"
+
+      - name: Stamp version (amd64)
+        if: steps.compare.outputs.changed == 'true'
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          tags: ${{ env.IMAGE }}:stamped
+          build-args: |
+            UPSTREAM_REVISION=${{ steps.pin.outputs.sha }}
+            UPSTREAM_VERSION=${{ steps.up.outputs.version }}
+            IMAGE_VERSION=${{ steps.ver.outputs.tag }}
+          cache-from: type=gha,scope=publish-amd64
+
+      - name: Smoke test
+        if: steps.compare.outputs.changed == 'true'
+        env:
+          TAG: ${{ steps.ver.outputs.tag }}
+          UPSTREAM_VERSION: ${{ steps.up.outputs.version }}
+        run: |
+          img="${IMAGE}:stamped"
+          docker run --rm --entrypoint dpkg-query "$img" -f='${Package} ${Version}\n' -W | sort > stamped.txt
+          grep -v '^npm:' manifest.txt | grep -v '^_' | sort > built.txt
+          if ! cmp -s built.txt stamped.txt; then
+            echo "stamped image packages differ from the manifest build" >&2
+            diff built.txt stamped.txt || true
+            exit 1
+          fi
+          docker run -d --name smoke "$img"
+          status=starting
+          for _ in $(seq 1 45); do
+            status="$(docker inspect -f '{{.State.Health.Status}}' smoke)"
+            [ "$status" = healthy ] && break
+            sleep 2
+          done
+          docker logs smoke
+          echo "health: $status"
+          test "$status" = healthy
+          docker logs smoke 2>&1 | grep -qF "ha-puppet ${TAG}, Puppet ${UPSTREAM_VERSION}"
+          test "$(docker inspect -f '{{index .Config.Labels "org.opencontainers.image.version"}}' "$img")" = "$TAG"
+          docker rm -f smoke
+
+      - name: Build and push (amd64, arm64)
+        id: push
+        if: steps.compare.outputs.changed == 'true'
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:${{ steps.ver.outputs.tag }}
+            ${{ env.IMAGE }}:${{ steps.ver.outputs.prefix }}
+            ${{ env.IMAGE }}:latest
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+          build-args: |
+            UPSTREAM_REVISION=${{ steps.pin.outputs.sha }}
+            UPSTREAM_VERSION=${{ steps.up.outputs.version }}
+            IMAGE_VERSION=${{ steps.ver.outputs.tag }}
+          provenance: mode=max
+          sbom: true
+          cache-from: type=gha,scope=publish-amd64
+
+      - uses: sigstore/cosign-installer@v4.1.3
+        if: steps.compare.outputs.changed == 'true'
+
+      - name: Sign image
+        if: steps.compare.outputs.changed == 'true'
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: cosign sign --yes "${IMAGE}@${DIGEST}"
+
+      - name: Attest build provenance
+        if: steps.compare.outputs.changed == 'true'
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+
+      - name: Write release notes
+        if: steps.compare.outputs.changed == 'true'
+        env:
+          TAG: ${{ steps.ver.outputs.tag }}
+          N: ${{ steps.ver.outputs.n }}
+          PREFIX: ${{ steps.ver.outputs.prefix }}
+          PREV_TAG: ${{ steps.compare.outputs.prev_tag }}
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          python3 - <<'EOF'
+          import os
+
+          env = os.environ
+          tag, n, prefix, prev_tag = env["TAG"], env["N"], env["PREFIX"], env["PREV_TAG"]
+          digest, image, repo = env["DIGEST"], env["IMAGE"], env["GITHUB_REPOSITORY"]
+
+          def load(path):
+              out = {}
+              if os.path.exists(path):
+                  for line in open(path):
+                      line = line.rstrip("\n")
+                      if line:
+                          key, val = line.split(" ", 1)
+                          out[key] = val
+              return out
+
+          cur, prev = load("manifest.txt"), load("prev-manifest.txt")
+          meta = lambda m: {k: v for k, v in m.items() if k.startswith("_")}
+          npm = lambda m: {k[4:]: v for k, v in m.items() if k.startswith("npm:")}
+          deb = lambda m: {k: v for k, v in m.items() if not k.startswith(("_", "npm:"))}
+          cm, pm = meta(cur), meta(prev)
+          up_ver, up_rev = cm["_upstream-version"], cm["_upstream-revision"]
+
+          lines = [f"## Puppet {up_ver}, packaging {cm['_packaging']}, build {n}", ""]
+          lines += ["```",
+                    f"Image     {image}:{tag}",
+                    f"Digest    {digest}",
+                    f"Upstream  balloob/home-assistant-addons@{up_rev[:7]} (Puppet {up_ver})",
+                    f"Node      {cm['_node']}",
+                    "```", ""]
+          lines += [f"Moving tags updated: `{prefix}`, `latest`. Platforms: linux/amd64, linux/arm64.", ""]
+
+          def table(title, old, new):
+              upgraded = [(p, old[p], new[p]) for p in sorted(new) if p in old and old[p] != new[p]]
+              added = [(p, new[p]) for p in sorted(new) if p not in old]
+              removed = [(p, old[p]) for p in sorted(old) if p not in new]
+              out = [f"#### {title}: {len(upgraded)} upgraded, {len(added)} added, {len(removed)} removed", ""]
+              if upgraded:
+                  out += ["| Package | From | To |", "|---|---|---|"]
+                  out += [f"| {p} | {a} | {b} |" for p, a, b in upgraded] + [""]
+              if added:
+                  out += ["| Added | Version |", "|---|---|"]
+                  out += [f"| {p} | {v} |" for p, v in added] + [""]
+              if removed:
+                  out += ["| Removed | Version |", "|---|---|"]
+                  out += [f"| {p} | {v} |" for p, v in removed] + [""]
+              return out
+
+          if not prev:
+              lines += [f"First release on this tag scheme. {len(deb(cur))} Debian and {len(npm(cur))} npm packages.", ""]
+          else:
+              lines += [f"### Changes since {prev_tag}", ""]
+              if pm.get("_upstream-revision") != up_rev:
+                  old_rev = pm.get("_upstream-revision", "")
+                  lines += [f"**Upstream Puppet {pm.get('_upstream-version', '?')} -> {up_ver}** "
+                            f"([diff](https://github.com/balloob/home-assistant-addons/compare/{old_rev}...{up_rev}))", ""]
+              if pm.get("_packaging") != cm["_packaging"]:
+                  lines += [f"**Packaging revision {pm.get('_packaging', '?')} -> {cm['_packaging']}**: breaking change to how the container is run, see the README.", ""]
+              if pm.get("_build-inputs") != cm["_build-inputs"]:
+                  lines += [f"**Container build inputs changed** (Dockerfile, entrypoint, .dockerignore or PACKAGING; "
+                            f"{pm.get('_build-inputs', '?')} -> {cm['_build-inputs']})", ""]
+              if pm.get("_node") != cm["_node"]:
+                  lines += [f"**Node {pm.get('_node', '?')} -> {cm['_node']}**", ""]
+              lines += table("Debian packages", deb(prev), deb(cur))
+              lines += table("npm packages", npm(prev), npm(cur))
+
+          lines += ["### Verify", "", "```",
+                    f"gh attestation verify oci://{image}:{tag} --owner {env['GITHUB_REPOSITORY_OWNER']}",
+                    f"cosign verify {image}:{tag} --certificate-identity-regexp '^https://github.com/{repo}/' "
+                    "--certificate-oidc-issuer https://token.actions.githubusercontent.com",
+                    "```", "",
+                    "The full manifest is attached as `manifest.txt`."]
+          open("notes.md", "w").write("\n".join(lines) + "\n")
+          print(open("notes.md").read())
+          EOF
+
+      - name: Create release
+        if: steps.compare.outputs.changed == 'true'
+        env:
+          TAG: ${{ steps.ver.outputs.tag }}
+        run: |
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --title "$TAG" \
+            --notes-file notes.md \
+            --target "$GITHUB_SHA" \
+            --latest \
+            manifest.txt
+
+      - name: Summary
+        if: always()
+        env:
+          CHANGED: ${{ steps.compare.outputs.changed }}
+          TAG: ${{ steps.ver.outputs.tag }}
+          PREV_TAG: ${{ steps.compare.outputs.prev_tag }}
+        run: |
+          if [ "$CHANGED" = true ] && [ -f notes.md ]; then
+            {
+              echo "Published \`${IMAGE}:${TAG}\`"
+              echo
+              cat notes.md
+            } >> "$GITHUB_STEP_SUMMARY"
+          elif [ "$CHANGED" = false ]; then
+            echo "No changes since \`${PREV_TAG}\`, nothing published." >> "$GITHUB_STEP_SUMMARY"
+          fi

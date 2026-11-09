@@ -25,6 +25,8 @@ function readToken() {
   return undefined;
 }
 
+log(`ha-puppet ${env.HA_PUPPET_VERSION ?? "dev"}, Puppet ${env.PUPPET_VERSION ?? "unknown"}`);
+
 if (existsSync("./options-dev.json")) {
   fail("/app/options-dev.json exists and would take precedence over /data/options.json; remove it");
 }
